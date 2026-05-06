@@ -554,7 +554,10 @@ async fn decrypt_cipher(
     cipherstring: &str,
     entry_key: Option<&str>,
     org_id: Option<&str>,
+    request_reprompt_hashes: Option<&std::collections::HashSet<[u8; 32]>>,
+    request_reuse: Option<&mut std::collections::HashSet<[u8; 32]>>,
 ) -> anyhow::Result<String> {
+    let mut request_reuse = request_reuse;
     let mut state = state.lock().await;
     if !state.master_password_reprompt_initialized() {
         let db = load_db().await?;
@@ -578,13 +581,18 @@ async fn decrypt_cipher(
         None
     };
 
-    let mut sha256 = sha2::Sha256::new();
-    sha256.update(cipherstring);
-    let master_password_reprompt: [u8; 32] = sha256.finalize().into();
-    if state
-        .master_password_reprompt
-        .contains(&master_password_reprompt)
-    {
+    let needs_reprompt = request_reuse.as_deref().map_or_else(
+        || requires_master_password_reprompt(&state, cipherstring),
+        |request_reuse| {
+            requires_master_password_reprompt_in_request(
+                &state,
+                request_reuse,
+                cipherstring,
+            )
+        },
+    );
+
+    if needs_reprompt {
         let db = load_db().await?;
 
         let Some(kdf) = db.kdf else {
@@ -644,6 +652,18 @@ async fn decrypt_cipher(
                 &db.protected_org_keys,
             ) {
                 Ok(_) => {
+                    if let (
+                        Some(request_reprompt_hashes),
+                        Some(request_reuse),
+                    ) = (
+                        request_reprompt_hashes,
+                        request_reuse.as_deref_mut(),
+                    ) {
+                        mark_successful_request_reprompt(
+                            request_reprompt_hashes,
+                            request_reuse,
+                        );
+                    }
                     break;
                 }
                 Err(rbw::error::Error::IncorrectPassword { message }) => {
@@ -672,6 +692,51 @@ async fn decrypt_cipher(
     Ok(plaintext)
 }
 
+fn master_password_reprompt_hash(cipherstring: &str) -> [u8; 32] {
+    let mut sha256 = sha2::Sha256::new();
+    sha256.update(cipherstring);
+    sha256.finalize().into()
+}
+
+fn requires_master_password_reprompt(
+    state: &crate::state::State,
+    cipherstring: &str,
+) -> bool {
+    state
+        .master_password_reprompt
+        .contains(&master_password_reprompt_hash(cipherstring))
+}
+
+fn collect_request_reprompt_hashes(
+    state: &crate::state::State,
+    items: &[rbw::protocol::DecryptItem],
+) -> std::collections::HashSet<[u8; 32]> {
+    items
+        .iter()
+        .filter(|item| {
+            requires_master_password_reprompt(state, &item.cipherstring)
+        })
+        .map(|item| master_password_reprompt_hash(&item.cipherstring))
+        .collect()
+}
+
+fn requires_master_password_reprompt_in_request(
+    state: &crate::state::State,
+    request_reuse: &std::collections::HashSet<[u8; 32]>,
+    cipherstring: &str,
+) -> bool {
+    let hash = master_password_reprompt_hash(cipherstring);
+    requires_master_password_reprompt(state, cipherstring)
+        && !request_reuse.contains(&hash)
+}
+
+fn mark_successful_request_reprompt(
+    request_reprompt_hashes: &std::collections::HashSet<[u8; 32]>,
+    request_reuse: &mut std::collections::HashSet<[u8; 32]>,
+) {
+    request_reuse.extend(request_reprompt_hashes.iter().copied());
+}
+
 pub async fn decrypt(
     sock: &mut crate::sock::Sock,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
@@ -680,10 +745,54 @@ pub async fn decrypt(
     entry_key: Option<&str>,
     org_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    let plaintext =
-        decrypt_cipher(state, environment, cipherstring, entry_key, org_id)
-            .await?;
+    let plaintext = decrypt_cipher(
+        state,
+        environment,
+        cipherstring,
+        entry_key,
+        org_id,
+        None,
+        None,
+    )
+    .await?;
     respond_decrypt(sock, plaintext).await?;
+
+    Ok(())
+}
+
+pub async fn decrypt_many(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+    items: &[rbw::protocol::DecryptItem],
+) -> anyhow::Result<()> {
+    let request_reprompt_hashes = {
+        let mut state = state.lock().await;
+        if !state.master_password_reprompt_initialized() {
+            let db = load_db().await?;
+            state.set_master_password_reprompt(&db.entries);
+        }
+        collect_request_reprompt_hashes(&state, items)
+    };
+    let mut request_reuse = std::collections::HashSet::new();
+    let mut plaintexts = Vec::with_capacity(items.len());
+
+    for item in items {
+        plaintexts.push(
+            decrypt_cipher(
+                state.clone(),
+                environment,
+                &item.cipherstring,
+                item.entry_key.as_deref(),
+                item.org_id.as_deref(),
+                Some(&request_reprompt_hashes),
+                Some(&mut request_reuse),
+            )
+            .await?,
+        );
+    }
+
+    respond_decrypt_many(sock, plaintexts).await?;
 
     Ok(())
 }
@@ -763,6 +872,16 @@ async fn respond_decrypt(
     plaintext: String,
 ) -> anyhow::Result<()> {
     sock.send(&rbw::protocol::Response::Decrypt { plaintext })
+        .await?;
+
+    Ok(())
+}
+
+async fn respond_decrypt_many(
+    sock: &mut crate::sock::Sock,
+    plaintexts: Vec<String>,
+) -> anyhow::Result<()> {
+    sock.send(&rbw::protocol::Response::DecryptMany { plaintexts })
         .await?;
 
     Ok(())
@@ -875,6 +994,8 @@ pub async fn get_ssh_public_keys(
                 encrypted,
                 entry.key.as_deref(),
                 entry.org_id.as_deref(),
+                None,
+                None,
             )
             .await?;
 
@@ -916,6 +1037,8 @@ pub async fn find_ssh_private_key(
                 public_key_enc,
                 entry.key.as_deref(),
                 entry.org_id.as_deref(),
+                None,
+                None,
             )
             .await?;
             let public_key_bytes =
@@ -937,6 +1060,8 @@ pub async fn find_ssh_private_key(
                     private_key_enc,
                     entry.key.as_deref(),
                     entry.org_id.as_deref(),
+                    None,
+                    None,
                 )
                 .await?;
 
@@ -949,4 +1074,123 @@ pub async fn find_ssh_private_key(
     }
 
     Err(anyhow::anyhow!("No matching private key found"))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[tokio::test]
+    async fn agent_reprompt_reuse_is_request_scoped() {
+        let (timeout, _timeout_rx) = crate::timeout::Timeout::new();
+        let (sync_timeout, _sync_timeout_rx) = crate::timeout::Timeout::new();
+        let password_cipherstring = "enc-protected-password";
+        let hidden_cipherstring = "enc-hidden-value";
+        let state = crate::state::State {
+            priv_key: None,
+            org_keys: None,
+            timeout,
+            timeout_duration: std::time::Duration::from_secs(1),
+            sync_timeout,
+            sync_timeout_duration: std::time::Duration::from_secs(1),
+            notifications_handler: crate::notifications::Handler::new(),
+            master_password_reprompt: std::collections::HashSet::from([
+                master_password_reprompt_hash(password_cipherstring),
+                master_password_reprompt_hash(hidden_cipherstring),
+            ]),
+            master_password_reprompt_initialized: true,
+            last_environment: rbw::protocol::Environment::new(None, vec![]),
+            #[cfg(feature = "clipboard")]
+            clipboard: None,
+        };
+        let items = vec![
+            rbw::protocol::DecryptItem {
+                cipherstring: password_cipherstring.to_string(),
+                entry_key: Some("enc-entry-key".to_string()),
+                org_id: None,
+            },
+            rbw::protocol::DecryptItem {
+                cipherstring: hidden_cipherstring.to_string(),
+                entry_key: Some("enc-entry-key".to_string()),
+                org_id: None,
+            },
+        ];
+        let request_reprompt_hashes =
+            collect_request_reprompt_hashes(&state, &items);
+        let mut request_reuse = std::collections::HashSet::new();
+
+        assert!(requires_master_password_reprompt_in_request(
+            &state,
+            &request_reuse,
+            password_cipherstring,
+        ));
+        assert!(requires_master_password_reprompt_in_request(
+            &state,
+            &request_reuse,
+            hidden_cipherstring,
+        ));
+
+        mark_successful_request_reprompt(
+            &request_reprompt_hashes,
+            &mut request_reuse,
+        );
+
+        assert!(!requires_master_password_reprompt_in_request(
+            &state,
+            &request_reuse,
+            password_cipherstring,
+        ));
+        assert!(!requires_master_password_reprompt_in_request(
+            &state,
+            &request_reuse,
+            hidden_cipherstring,
+        ));
+
+        let next_request_reuse = std::collections::HashSet::new();
+        assert!(requires_master_password_reprompt_in_request(
+            &state,
+            &next_request_reuse,
+            hidden_cipherstring,
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_failed_reprompt_is_not_cached() {
+        let (timeout, _timeout_rx) = crate::timeout::Timeout::new();
+        let (sync_timeout, _sync_timeout_rx) = crate::timeout::Timeout::new();
+        let cipherstring = "enc-protected-secret";
+
+        let mut state = crate::state::State {
+            priv_key: None,
+            org_keys: None,
+            timeout,
+            timeout_duration: std::time::Duration::from_secs(1),
+            sync_timeout,
+            sync_timeout_duration: std::time::Duration::from_secs(1),
+            notifications_handler: crate::notifications::Handler::new(),
+            master_password_reprompt: std::collections::HashSet::from([
+                master_password_reprompt_hash(cipherstring),
+            ]),
+            master_password_reprompt_initialized: true,
+            last_environment: rbw::protocol::Environment::new(None, vec![]),
+            #[cfg(feature = "clipboard")]
+            clipboard: None,
+        };
+
+        assert!(requires_master_password_reprompt(&state, cipherstring));
+
+        let failed_reprompt =
+            Err::<(), _>(rbw::error::Error::IncorrectPassword {
+                message: "wrong password".to_string(),
+            });
+        assert!(failed_reprompt.is_err());
+
+        assert!(
+            requires_master_password_reprompt(&state, cipherstring),
+            "a failed reprompt attempt must not clear future reprompts for the same cipherstring",
+        );
+
+        state.master_password_reprompt.clear();
+        assert!(!requires_master_password_reprompt(&state, cipherstring));
+    }
 }

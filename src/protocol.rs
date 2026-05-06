@@ -165,6 +165,15 @@ impl Environment {
     }
 }
 
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Hash,
+)]
+pub struct DecryptItem {
+    pub cipherstring: String,
+    pub entry_key: Option<String>,
+    pub org_id: Option<String>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(tag = "type")]
 pub enum Action {
@@ -178,6 +187,9 @@ pub enum Action {
         cipherstring: String,
         entry_key: Option<String>,
         org_id: Option<String>,
+    },
+    DecryptMany {
+        items: Vec<DecryptItem>,
     },
     Encrypt {
         plaintext: String,
@@ -196,6 +208,84 @@ pub enum Response {
     Ack,
     Error { error: String },
     Decrypt { plaintext: String },
+    DecryptMany { plaintexts: Vec<String> },
     Encrypt { cipherstring: String },
     Version { version: u32 },
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn protocol_decrypt_many_round_trips() {
+        let items = vec![
+            DecryptItem {
+                cipherstring: "enc-password".to_string(),
+                entry_key: Some("enc-entry-key".to_string()),
+                org_id: Some("org-id".to_string()),
+            },
+            DecryptItem {
+                cipherstring: "enc-hidden-value".to_string(),
+                entry_key: Some("enc-entry-key".to_string()),
+                org_id: Some("org-id".to_string()),
+            },
+        ];
+        let request = Request::new(
+            Environment::new(
+                Some(std::ffi::OsString::from("/dev/pts/1")),
+                vec![(
+                    std::ffi::OsString::from("TERM"),
+                    std::ffi::OsString::from("xterm-256color"),
+                )],
+            ),
+            Action::DecryptMany {
+                items: items.clone(),
+            },
+        );
+
+        let request_json = serde_json::to_string(&request).unwrap();
+        let round_trip =
+            serde_json::from_str::<Request>(&request_json).unwrap();
+        let (action, environment) = round_trip.into_parts();
+
+        match action {
+            Action::DecryptMany {
+                items: round_tripped,
+            } => {
+                assert_eq!(round_tripped, items);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+
+        assert_eq!(
+            environment.tty(),
+            Some(std::ffi::OsStr::new("/dev/pts/1"))
+        );
+        assert_eq!(
+            environment
+                .env_vars()
+                .get(std::ffi::OsStr::new("TERM"))
+                .map(std::ffi::OsString::as_os_str),
+            Some(std::ffi::OsStr::new("xterm-256color")),
+        );
+
+        let response = Response::DecryptMany {
+            plaintexts: vec![
+                "password".to_string(),
+                "secret answer".to_string(),
+            ],
+        };
+        let response_json = serde_json::to_string(&response).unwrap();
+
+        match serde_json::from_str::<Response>(&response_json).unwrap() {
+            Response::DecryptMany { plaintexts } => {
+                assert_eq!(
+                    plaintexts,
+                    vec!["password".to_string(), "secret answer".to_string()],
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
 }
