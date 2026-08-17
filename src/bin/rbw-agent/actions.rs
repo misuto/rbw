@@ -581,9 +581,21 @@ async fn decrypt_cipher(
     let mut sha256 = sha2::Sha256::new();
     sha256.update(cipherstring);
     let master_password_reprompt: [u8; 32] = sha256.finalize().into();
+    // entries without a resolvable id (shouldn't normally happen, since
+    // set_master_password_reprompt always records one alongside the
+    // protected-cipherstring hash) fall back to reprompting every time,
+    // since there's no entry to record a confirmation against.
+    let reprompt_entry_id = state
+        .reprompt_entry_id(&master_password_reprompt)
+        .map(std::string::ToString::to_string);
+    let already_confirmed =
+        reprompt_entry_id.as_deref().is_some_and(|entry_id| {
+            state.master_password_reprompt_confirmed.contains(entry_id)
+        });
     if state
         .master_password_reprompt
         .contains(&master_password_reprompt)
+        && !already_confirmed
     {
         let db = load_db().await?;
 
@@ -644,6 +656,11 @@ async fn decrypt_cipher(
                 &db.protected_org_keys,
             ) {
                 Ok(_) => {
+                    if let Some(entry_id) = &reprompt_entry_id {
+                        state
+                            .master_password_reprompt_confirmed
+                            .insert(entry_id.clone());
+                    }
                     break;
                 }
                 Err(rbw::error::Error::IncorrectPassword { message }) => {
@@ -660,6 +677,14 @@ async fn decrypt_cipher(
         }
     }
 
+    // re-fetch rather than reusing the `keys` borrowed above: that borrow's
+    // lifetime would otherwise span the reprompt block, conflicting with
+    // the mutable borrow used there to record the confirmation.
+    let Some(keys) = state.key(org_id) else {
+        return Err(anyhow::anyhow!(
+            "failed to find decryption keys in in-memory state"
+        ));
+    };
     let cipherstring = rbw::cipherstring::CipherString::new(cipherstring)
         .context("failed to parse encrypted secret")?;
     let plaintext = String::from_utf8(

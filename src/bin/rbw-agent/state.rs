@@ -11,6 +11,24 @@ pub struct State {
     pub notifications_handler: crate::notifications::Handler,
     pub master_password_reprompt: std::collections::HashSet<[u8; 32]>,
     pub master_password_reprompt_initialized: bool,
+    // maps each protected cipherstring's hash to the id of the entry it
+    // belongs to, so that a reprompt confirmation can be recorded against
+    // the whole entry rather than just the one field that happened to
+    // trigger it (see set_master_password_reprompt and the comment on
+    // master_password_reprompt_confirmed below).
+    pub master_password_reprompt_entry:
+        std::collections::HashMap<[u8; 32], String>,
+    // entry ids that have already been confirmed via a reprompt during the
+    // current unlock. without this, every single decrypt of a protected
+    // field reprompts independently, so a single `rbw get` on an entry with
+    // more than one protected field (e.g. password + totp) shows multiple
+    // prompts for what the user experiences as one access to one object.
+    // tracking by entry id (rather than by individual field cipherstring)
+    // means confirming any one protected field on an entry unlocks all of
+    // that entry's other protected fields for the rest of this unlock.
+    // cleared on lock, same as the unlocked keys themselves, so a
+    // confirmation never outlives the unlock it was granted under.
+    pub master_password_reprompt_confirmed: std::collections::HashSet<String>,
 
     // this is stored here specifically for the use of the ssh agent, because
     // requests made to the ssh agent don't include an environment, and so we
@@ -47,6 +65,16 @@ impl State {
         self.priv_key = None;
         self.org_keys = None;
         self.timeout.clear();
+        self.master_password_reprompt_confirmed.clear();
+    }
+
+    // returns the entry id that the given protected cipherstring hash
+    // belongs to, if any, for use as the key into
+    // master_password_reprompt_confirmed.
+    pub fn reprompt_entry_id(&self, hash: &[u8; 32]) -> Option<&str> {
+        self.master_password_reprompt_entry
+            .get(hash)
+            .map(std::string::String::as_str)
     }
 
     pub fn set_sync_timeout(&self) {
@@ -69,24 +97,35 @@ impl State {
     //
     // therefore, the solution we choose here is to keep an in-memory set of
     // cipherstrings that we know correspond to entries with master password
-    // reprompt enabled. this set is only updated when the agent itself does
-    // a sync, so it can't be bypassed by editing the on-disk file directly.
-    // if the agent gets a request for any of those cipherstrings that it saw
-    // marked as master password reprompt during the most recent sync, it
-    // forces a reprompt.
+    // reprompt enabled, along with which entry each one belongs to. this
+    // set is only updated when the agent itself does a sync, so it can't be
+    // bypassed by editing the on-disk file directly. if the agent gets a
+    // request for any of those cipherstrings that it saw marked as master
+    // password reprompt during the most recent sync, it forces a reprompt -
+    // unless that cipherstring's entry is already in
+    // master_password_reprompt_confirmed, meaning the user has already
+    // reproved possession of the master password for that entry earlier in
+    // this same unlock. that second set is keyed by entry id rather than by
+    // individual cipherstring, which is what keeps a single logical access
+    // (e.g. `rbw get` on an entry with both a protected password and a
+    // protected totp secret) from reprompting once per protected field
+    // instead of once for the whole entry.
     pub fn set_master_password_reprompt(
         &mut self,
         entries: &[rbw::db::Entry],
     ) {
         self.master_password_reprompt.clear();
+        self.master_password_reprompt_entry.clear();
 
         let mut hasher = sha2::Sha256::new();
-        let mut insert = |s: Option<&str>| {
+        let mut insert = |entry_id: &str, s: Option<&str>| {
             if let Some(s) = s {
                 if !s.is_empty() {
                     hasher.update(s);
-                    self.master_password_reprompt
-                        .insert(hasher.finalize_reset().into());
+                    let hash: [u8; 32] = hasher.finalize_reset().into();
+                    self.master_password_reprompt.insert(hash);
+                    self.master_password_reprompt_entry
+                        .insert(hash, entry_id.to_string());
                 }
             }
         };
@@ -98,30 +137,30 @@ impl State {
 
             match &entry.data {
                 rbw::db::EntryData::Login { password, totp, .. } => {
-                    insert(password.as_deref());
-                    insert(totp.as_deref());
+                    insert(&entry.id, password.as_deref());
+                    insert(&entry.id, totp.as_deref());
                 }
                 rbw::db::EntryData::Card { number, code, .. } => {
-                    insert(number.as_deref());
-                    insert(code.as_deref());
+                    insert(&entry.id, number.as_deref());
+                    insert(&entry.id, code.as_deref());
                 }
                 rbw::db::EntryData::Identity {
                     ssn,
                     passport_number,
                     ..
                 } => {
-                    insert(ssn.as_deref());
-                    insert(passport_number.as_deref());
+                    insert(&entry.id, ssn.as_deref());
+                    insert(&entry.id, passport_number.as_deref());
                 }
                 rbw::db::EntryData::SecureNote => {}
                 rbw::db::EntryData::SshKey { private_key, .. } => {
-                    insert(private_key.as_deref());
+                    insert(&entry.id, private_key.as_deref());
                 }
             }
 
             for field in &entry.fields {
                 if field.ty == Some(rbw::api::FieldType::Hidden) {
-                    insert(field.value.as_deref());
+                    insert(&entry.id, field.value.as_deref());
                 }
             }
         }
